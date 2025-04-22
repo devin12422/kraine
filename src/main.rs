@@ -1,4 +1,3 @@
-use std::collections::{BTreeMap};
 use rustc_hash::{FxHashMap, FxHashSet};
 use argmin::core::{Error, CostFunction, Gradient, Executor};
 use clap::{Args, Parser, ValueEnum};
@@ -16,7 +15,7 @@ use pyo3::ffi::c_str;
 use meshopt::{ generate_vertex_remap};
 use pyo3::IntoPyObjectExt;
 extern crate meshopt;
-
+use rayon::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -35,26 +34,24 @@ struct DevelopArgs {
     mesh_index: usize,
     #[arg(short, long,default_value = "10")]
     iters: u64,
-    #[arg(long,default_value = "1e-4")]
+    #[arg(long,default_value = "1e-6")]
     c1: f64,
     #[arg(long,default_value = "0.9")]
     c2: f64,
-    #[arg(long,default_value = "0.1")]
-    delta: f64,
-    #[arg(long,default_value = "0.9")]
-    sigma: f64,
     #[arg(long,default_value = "0.66")]
     gamma: f64,
     #[arg(long,default_value = "0.01")]
     eta: f64,
-    #[arg(long,default_value = "1e-6")]
+    #[arg(long,default_value = "1e-10")]
     epsilon: f64,
     #[arg(long,default_value = "0.5")]
     theta: f64,
-    #[arg(long,default_value = "1e-6")]
+    #[arg(long,default_value = "1e-10")]
     tol_grad: f64,
-    #[arg(long,default_value = "1e-6")]
+    #[arg(long,default_value = "1e-10")]
     tol_cost: f64,
+    #[arg(long,default_value = "1e-10")]
+    tol_width: f64,
     #[arg(long)]
     with_l1: Option<f64>,
 }
@@ -70,23 +67,7 @@ enum Normalization {
     Score,
     Gradient,
 }
-#[derive(Args,Copy, Clone,)]
-struct MoreThuenteArgs {
-    #[arg(long,default_value = "1e-4")]
-    c1:f64,
-    #[arg(long,default_value = "0.9")]
-    c2:f64,
-}
-impl Default for MoreThuenteArgs {
-    fn default() -> Self {
-        MoreThuenteArgs{
-            c1:1e-4, c2:0.9
-        }
-    }
-}
-#[derive(Args, Debug, Default, Clone)]
-struct HagerZhangArgs {
-}
+
 #[derive(Clone, Debug)]
 struct Partition{
     faces: FxHashSet<Face>,
@@ -97,6 +78,7 @@ struct Partition{
 
 #[derive(PartialEq, Copy, Clone, Hash, Eq, Debug)]
 struct Face([u32; 3]);
+#[derive( Clone, Debug)]
 struct VertexPartition{
     partitions: [Option<Partition>; 2],
     score:f64
@@ -166,20 +148,20 @@ impl MeshDevelopability {
                 if vertex_star_arity <= 3{
                     continue 'vertex_star_loop;
                 }
-                if let ControlFlow::Continue(vertex_partition) = (1..=vertex_star_arity).try_fold(VertexPartition{partitions:[None,None],score:f64::MAX},| mut vertex_partition,big_partition_size|{
+                let vertex_partition = (1..=vertex_star_arity).into_par_iter().map(| big_partition_size|{
                     // The primary partition contains at least one face in a given vertex star, but can contain all of them
                     // For all faces, we iterate over both edges.
                     // There is no mechanism to determine if an edge has been used for partitioning previously.
                     // This doubles the amount of work done per triangle in a given mesh
                     //I believe we can get away with iterating over just 1 edge, but this code lets be lazy AND correct  *hopefully
                     let partition_face_edges = partition_face.get_face_index_face_edges(vertex_star_face_index);
-                    if let ControlFlow::Continue(current_partition) = partition_face_edges.iter().try_fold(VertexPartition{partitions:[None,None],score:f64::MAX},|mut vertex_partition,partition_face_edge|{
+                    partition_face_edges.par_iter().map(|partition_face_edge|{
                         let partition_edge = partition_face.convert_face_edge_to_edge(*partition_face_edge);
-                        if let ControlFlow::Continue(current_partition) = ([(Some(partition_face.clone()),big_partition_size),(self.get_other_side_of_edge(partition_face,partition_edge).cloned(),vertex_star_arity - big_partition_size)]).iter().try_fold(VertexPartition{partitions:[None,None],score:0.0f64},|mut vertex_partition,(face,partition_size)|{
+                        ([(Some(partition_face.clone()),big_partition_size),(self.get_other_side_of_edge(partition_face,partition_edge).cloned(),vertex_star_arity - big_partition_size)]).par_iter().map(|(face,partition_size)|{
                             if partition_size == &0{
-                                ControlFlow::Continue(vertex_partition)// We do not iterate over the second partition if it's size is 0 (this may be the second partition)
-                            }else
-                            {
+                                ControlFlow::Break(())// We do not iterate over the second partition if it's size is 0 (this may be the second partition)
+                            }
+                            else {
                                 let mut partition = Partition{
                                     faces: FxHashSet::default(),
                                     edges: [partition_edge,partition_edge],
@@ -187,65 +169,94 @@ impl MeshDevelopability {
                                     score: 0.0,
                                 };
                                 //This should change the iteration direction and partition starting face based off of which partition from the set we're currently calculating (i)
-                                if let Some(face) = face{
                                     // We now have our partition parameters (starting edge, partition size, and iteration direction
                                     // We use a different iterator from the others here, and we have to do the same iteration twice
-                                    if (0usize..partition_size.clone()).try_fold(face, |face, _index|{
+                                if(0usize..partition_size.clone()).try_fold( face.clone(),|face, _index|{
+                                    if let Some(face) = face{
                                         partition.average_normal += self.calculate_face_normal(&face,p);
                                         partition.faces.insert(face.clone());
                                         //Finish up iteration
                                         partition.edges[1] = face.get_face_index_edge_other_edge(face.get_face_index_of_index(vertex_star_index).unwrap(), partition.edges[1]);
-                                        self.get_other_side_of_edge(&face, partition.edges[1])
-                                    }).is_some()
-                                    {
-                                        partition.average_normal /= partition.faces.len() as f64; // DO NOT DIVIDE BY VERTEX_ARITY
-                                        (self.partition_score)(&self, &mut partition, p);
+                                        ControlFlow::Continue(self.get_other_side_of_edge(&face, partition.edges[1]).cloned())
 
-                                        if partition.score > vertex_partition.score {
-                                            //The score of a vertex partition (pair of partitions)
-                                            // is the maximum score of it's two partitions
-                                            vertex_partition.score = partition.score;
-                                        }
-                                        if vertex_partition.partitions[0].is_none(){
-                                            vertex_partition.partitions[0] = Some(partition);
-
-                                        }else{
-                                            vertex_partition.partitions[1] = Some(partition);
-                                        }
-                                        ControlFlow::Continue(vertex_partition)
-                                    } else
-                                    {
-                                        ControlFlow::Break(vertex_partition) //Interior iteration has failed, return None
+                                    }else{
+                                        ControlFlow::Break(())
                                     }
+
+                                }).is_continue(){
+                                    partition.average_normal /= partition.faces.len() as f64; // DO NOT DIVIDE BY VERTEX_ARITY
+                                    (self.partition_score)(&self, &mut partition, p);
+                                    // // ControlFlow::Continue(partition)
+
+                                    ControlFlow::Continue(partition)
                                 }else{
-                                    ControlFlow::Break(vertex_partition)
+                                    ControlFlow::Break(())
                                 }
                             }
 
-                        }){
-                            if vertex_partition.score > current_partition.score{
-                                vertex_partition = current_partition;
+                        }).fold(|| { VertexPartition { partitions: [None, None], score: f64::MAX } },|mut vertex_partition, partition|{
+                            if let ControlFlow::Continue(partition) = partition{
+                                if vertex_partition.partitions[0].is_none(){
+                                    vertex_partition.score = partition.score;
+                                    vertex_partition.partitions[0] = Some(partition);
+                                }else{
+                                    if partition.score > vertex_partition.score{
+                                        vertex_partition.score = partition.score;
+                                    }
+                                    vertex_partition.partitions[1] = Some(partition);
+                                }
                             }
-                            ControlFlow::Continue(vertex_partition)
+                            vertex_partition
+                        }).reduce(|| { VertexPartition { partitions: [None, None], score: f64::MAX } },|mut vertex_partition_a,mut vertex_partition_b|{
+                            if vertex_partition_a.partitions[0].is_none(){
+                               vertex_partition_b
+                            }else if vertex_partition_b.partitions[0].is_none(){
+                                vertex_partition_a
+                            }else{
+                                if vertex_partition_a.score > vertex_partition_b.score{
+                                    vertex_partition_a.partitions[1] = vertex_partition_b.partitions[0].clone();
+                                    vertex_partition_a
+                                }else{
+                                    vertex_partition_b.partitions[1] = vertex_partition_a.partitions[0].clone();
+                                    vertex_partition_b
+                                }
+                            }
+                        })
+                    }).reduce(|| { VertexPartition { partitions: [None, None], score: f64::MAX } },|mut vertex_partition_a,mut vertex_partition_b|{
+                        if vertex_partition_a.partitions[0].is_none(){
+                            vertex_partition_b
+                        }else if vertex_partition_b.partitions[0].is_none(){
+                            vertex_partition_a
                         }else{
-                            ControlFlow::Break(vertex_partition)
+                            if vertex_partition_a.score < vertex_partition_b.score{
+                                vertex_partition_a.partitions[1] = vertex_partition_b.partitions[0].clone();
+                                vertex_partition_a
+                            }else{
+                                vertex_partition_b.partitions[1] = vertex_partition_a.partitions[0].clone();
+                                vertex_partition_b
+                            }
                         }
-
-                    }){
-                        if vertex_partition.score > current_partition.score{
-                            vertex_partition = current_partition;
-                        }
-                        ControlFlow::Continue(vertex_partition)
+                    })
+                }).reduce(|| { VertexPartition { partitions: [None, None], score: f64::MAX } },|mut vertex_partition_a,mut vertex_partition_b|{
+                    if vertex_partition_a.partitions[0].is_none(){
+                        vertex_partition_b
+                    }else if vertex_partition_b.partitions[0].is_none(){
+                        vertex_partition_a
                     }else{
-                        ControlFlow::Break(vertex_partition)
+                        if vertex_partition_a.score < vertex_partition_b.score{
+                            vertex_partition_a.partitions[1] = vertex_partition_b.partitions[0].clone();
+                            vertex_partition_a
+                        }else{
+                            vertex_partition_b.partitions[1] = vertex_partition_a.partitions[0].clone();
+                            vertex_partition_b
+                        }
                     }
-
-                }){
+                });
                     // If out of all the partition sizes,
                     // expanding out in either direction, starting from this face,
                     // we have obtained the partition set with the lowest score
                     vertex_partition_map.insert(vertex_star_index, vertex_partition);
-                }
+
             }
         }
         vertex_partition_map
@@ -257,44 +268,38 @@ impl MeshDevelopability {
         //     // for all of it's faces
         //     partition.score = score;
         // }
-        let pnormal = match self.normalization{
-            Normalization::All => {
-                partition.average_normal.normalize()
-            }
-            Normalization::Score => {
-                partition.average_normal.normalize()
-            }
-            _ => {
-                partition.average_normal
-            }
-        };
         // DIVIDE BY PARTITION SIZE
-        for face in &partition.faces{
-            for other_face in &partition.faces{
-                if other_face != face {
-                    let score =
-                        match self.normalization{
-                            Normalization::All => {
-                                self.calculate_face_normal(face,p).normalize()-self.calculate_face_normal(other_face, p).normalize()
-                            },
-                            Normalization::Score => {
-                                self.calculate_face_normal(face,p).normalize()-self.calculate_face_normal(other_face, p).normalize()
-                            },
-                            _=>{
-                                self.calculate_face_normal(face,p)-self.calculate_face_normal(other_face, p)
-                            }
-                        }.magnitude_squared();
-                    if score > partition.score {
-                        // The score for a given partition is the maximum of
-                        // the magnitude squared of a face's normal from the average
-                        // for all of it's faces
-                        partition.score = score;
+        partition.score = partition.faces.par_iter().map(|face|{
+                partition.faces.par_iter().map(|other_face|{
+                    if other_face != face {
+                            match self.normalization{
+                                Normalization::All => {
+                                    self.calculate_face_normal(face,p).normalize()-self.calculate_face_normal(other_face, p).normalize()
+                                },
+                                Normalization::Score => {
+                                    self.calculate_face_normal(face,p).normalize()-self.calculate_face_normal(other_face, p).normalize()
+                                },
+                                _=>{
+                                    self.calculate_face_normal(face,p)-self.calculate_face_normal(other_face, p)
+                                }
+                            }.magnitude_squared()
+                    }else{
+                        0f64
                     }
-
-                }
+                }).reduce(||{0f64}, |a,b|{
+                    if a > b {
+                        a
+                    }else{
+                        b
+                    }
+                })
+        }).reduce(||{ 0f64 }, |a, b|{
+            if a > b {
+                a
+            }else{
+                b
             }
-
-        }
+        }).clone();
     }
     fn calculate_partition_score(&self, partition: &mut Partition,p: &[f64]){
         let pnormal = match self.normalization{
@@ -308,27 +313,26 @@ impl MeshDevelopability {
                 partition.average_normal
             }
         };
-        // DIVIDE BY PARTITION SIZE
-        for face in &partition.faces{
-                let score =
-                    match self.normalization{
-                        Normalization::All => {
-                            self.calculate_face_normal(face,p).normalize()-pnormal
-                        },
-                        Normalization::Score => {
-                            self.calculate_face_normal(face,p).normalize()-pnormal
-                        },
-                        _=>{
-                            self.calculate_face_normal(face,p)-pnormal
-                        }
-                    }.magnitude_squared();
-                if score > partition.score {
-                    // The score for a given partition is the maximum of
-                    // the magnitude squared of a face's normal from the average
-                    // for all of it's faces
-                    partition.score = score;
+        partition.score = partition.faces.par_iter().map(|face|{
+            match self.normalization{
+                Normalization::All => {
+                    self.calculate_face_normal(face,p).normalize()-pnormal
+                },
+                Normalization::Score => {
+                    self.calculate_face_normal(face,p).normalize()-pnormal
+                },
+                _=>{
+                    self.calculate_face_normal(face,p)-pnormal
                 }
-        }
+            }.magnitude_squared()
+        }).reduce(||{ 0f64 }, |a, b|{
+            if a > b {
+                a
+            }else{
+                b
+            }
+        }).clone();
+        // DIVIDE BY PARTITION SIZE
     }
     fn calculate_pair_gradient(&self,p:&[f64],gradients:&mut [f64],partition:&Partition,vertex_star_index:&u32){
         for face1 in partition.faces.iter(){
@@ -553,6 +557,8 @@ impl Gradient for MeshDevelopability {
 }
 fn main() {
     let args = DevelopArgs::parse();
+    println!("Args:{:?}",args);
+
     let input_mesh_path = args.path.unwrap_or(rfd::FileDialog::new().add_filter("OBJ",&["obj"]).pick_file().unwrap());
     let (models, _) = tobj::load_obj(
         &input_mesh_path,
@@ -563,7 +569,6 @@ fn main() {
             ..Default::default()
         },
     ).unwrap();
-
     let loaded_mesh = models[args.mesh_index].clone().mesh;
 
     let indices:Vec<u32> = vec![0;loaded_mesh.indices.len()];
@@ -626,8 +631,8 @@ fn main() {
             //.unwrap();
          let res_vertices = match args.linesearch{
             LinesearchType::MoreThuente => {
-                let linesearch =MoreThuenteLineSearch::new().with_c(args.c1,args.c2).unwrap();
-                let tmp_solver = LBFGS::new(linesearch, 7).with_tolerance_cost(args.tol_cost).unwrap().with_tolerance_grad(args.tol_grad).unwrap();
+                let linesearch =MoreThuenteLineSearch::new().with_c(args.c1,args.c2).unwrap().with_width_tolerance(args.tol_width).unwrap();
+                let tmp_solver = LBFGS::new(linesearch, 8).with_tolerance_cost(args.tol_cost).unwrap().with_tolerance_grad(args.tol_grad).unwrap();
                 let solver = if let Some(l1) = args.with_l1{
                     tmp_solver.with_l1_regularization(l1).unwrap()
                 }else{
@@ -640,8 +645,8 @@ fn main() {
                     .run().unwrap().state.best_param.unwrap()
             }
             LinesearchType::HagerZhang => {
-                let linesearch = HagerZhangLineSearch::new().with_delta_sigma(args.delta,args.sigma).unwrap().with_epsilon(args.epsilon).unwrap().with_gamma(args.gamma).unwrap().with_theta(args.theta).unwrap().with_eta(args.eta).unwrap();
-                let tmp_solver = LBFGS::new(linesearch, 7).with_tolerance_cost(args.tol_cost).unwrap().with_tolerance_grad(args.tol_grad).unwrap();
+                let linesearch = HagerZhangLineSearch::new().with_delta_sigma(args.c1,args.c2).unwrap().with_epsilon(args.epsilon).unwrap().with_gamma(args.gamma).unwrap().with_theta(args.theta).unwrap().with_eta(args.eta).unwrap();
+                let tmp_solver = LBFGS::new(linesearch, 8).with_tolerance_cost(args.tol_cost).unwrap().with_tolerance_grad(args.tol_grad).unwrap();
                 let solver = if let Some(l1) = args.with_l1{
                     tmp_solver.with_l1_regularization(l1).unwrap()
                 }else{
