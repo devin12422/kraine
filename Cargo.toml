@@ -1,0 +1,25 @@
+[package]
+name = "kraine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+argmin = { version = "0.10",features = ["rayon"] }
+argmin-math = { version = "0.4", features = [ "nalgebra_latest"] }
+clap = { version = "4.5.37", features = ["derive"] }
+nalgebra = "0.33.2"
+rfd = "0.15.3"
+
+ultraviolet = "0.9.2"
+meshopt = "0.4.1"
+pyo3 = {version =  "0.24.1",features = ["auto-initialize"] }
+tobj = { version = "4.0.3"}
+argmin-observer-slog = "0.1.0"
+rustc-hash = "2.1.1"
+num-traits = "0.2.19"
+rayon = "1.10.0"
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
