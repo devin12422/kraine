@@ -1,8 +1,7 @@
-use num_traits::float::Float;
 use std::collections::{BTreeMap};
 use rustc_hash::{FxHashMap, FxHashSet};
 use argmin::core::{Error, CostFunction, Gradient, Executor};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, ValueEnum};
 use std::path::PathBuf;
 use argmin::solver::quasinewton::LBFGS;
 use nalgebra::Vector3;
@@ -67,9 +66,9 @@ enum LinesearchType {
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum,Debug)]
 enum Normalization {
     None,
-    AllNormals,
-    ScoreOnly,
-    GradientOnly,
+    All,
+    Score,
+    Gradient,
 }
 #[derive(Args,Copy, Clone,)]
 struct MoreThuenteArgs {
@@ -105,9 +104,371 @@ struct VertexPartition{
 #[derive(Clone, Debug)]
 struct MeshDevelopability {
     faces: Vec<Face>,
-    vertex_face_map:BTreeMap<u32,Vec<Face>>,
-    use_pairs:bool,
+    vertex_face_map:FxHashMap<u32,Vec<Face>>,
     normalization: Normalization,
+    partition_score:fn(&MeshDevelopability,&mut Partition, &[f64]),
+    gradient_fn:fn(&MeshDevelopability, &[f64], &mut[f64],&Partition,&u32),
+
+}
+impl MeshDevelopability {
+    fn get_vertex_face_map(&self) -> &FxHashMap<u32, Vec<Face>> {
+        &self.vertex_face_map
+    }
+
+    fn get_faces(&self) -> &Vec<Face> {
+        &self.faces
+    }
+    fn get_edge_adjacent_faces(&self, edge:[u32;2]) ->Vec<&Face>{
+        let mut adjacent_faces = Vec::new();
+        for face in&self.get_vertex_face_map()[&edge[0]]{
+            for rhs in &self.get_vertex_face_map()[&edge[1]]{
+                if rhs == face{
+                    adjacent_faces.push(face);
+                }
+            }
+        }
+        adjacent_faces
+    }
+    fn get_other_side_of_edge(&self, face:&Face,edge:[u32;2]) ->Option<&Face>{
+        let faces = self.get_edge_adjacent_faces(edge);
+        if faces.len() <= 1{
+            return None
+        }
+        if faces[0] == face {
+            Some(faces[1])
+        } else { Some(faces[0]) }
+    }
+    fn calculate_face_normal(&self,face:&Face,p:&[f64])->Vector3<f64>{
+        let i1 = get_vertex_position(p,  face.0[0]);
+        let j1 = get_vertex_position(p, face.0[1]);
+        let k1 = get_vertex_position(p, face.0[2]);
+        // let i_face_index = face.get_face_index_of_index(*i_index).unwrap();
+        let eki1 = i1 - k1;
+        let eij1 = j1 - i1;
+        eij1.cross(&eki1)
+    }
+    fn calculate_face_index_face_normal(&self,face:&Face,p:&[f64],face_index:usize)->Vector3<f64>{
+        let i1 = get_vertex_position(p,  face.0[face_index]);
+        let j1 = get_vertex_position(p, face.0[(face_index+1)%3]);
+        let k1 = get_vertex_position(p, face.0[(face_index+2)%3]);
+        // let i_face_index = face.get_face_index_of_index(*i_index).unwrap();
+        let eki1 = i1 - k1;
+        let eij1 = j1 - i1;
+        eij1.cross(&eki1)
+    }
+    fn create_vertex_partition_map(&self, p: &[f64]) -> FxHashMap<u32,VertexPartition>{
+        let mut vertex_partition_map:FxHashMap<u32,VertexPartition> =FxHashMap::default();
+        for partition_face in self.get_faces(){
+            'vertex_star_loop : for vertex_star_face_index in 0..3 {
+                let vertex_star_index = partition_face.0[vertex_star_face_index];
+                let vertex_star_faces = self.get_vertex_face_map().get(&vertex_star_index).unwrap();
+                let vertex_star_arity = vertex_star_faces.len();
+                if vertex_star_arity <= 3{
+                    continue 'vertex_star_loop;
+                }
+                if let ControlFlow::Continue(vertex_partition) = (1..=vertex_star_arity).try_fold(VertexPartition{partitions:[None,None],score:f64::MAX},| mut vertex_partition,big_partition_size|{
+                    // The primary partition contains at least one face in a given vertex star, but can contain all of them
+                    // For all faces, we iterate over both edges.
+                    // There is no mechanism to determine if an edge has been used for partitioning previously.
+                    // This doubles the amount of work done per triangle in a given mesh
+                    //I believe we can get away with iterating over just 1 edge, but this code lets be lazy AND correct  *hopefully
+                    let partition_face_edges = partition_face.get_face_index_face_edges(vertex_star_face_index);
+                    if let ControlFlow::Continue(current_partition) = partition_face_edges.iter().try_fold(VertexPartition{partitions:[None,None],score:f64::MAX},|mut vertex_partition,partition_face_edge|{
+                        let partition_edge = partition_face.convert_face_edge_to_edge(*partition_face_edge);
+                        if let ControlFlow::Continue(current_partition) = ([(Some(partition_face.clone()),big_partition_size),(self.get_other_side_of_edge(partition_face,partition_edge).cloned(),vertex_star_arity - big_partition_size)]).iter().try_fold(VertexPartition{partitions:[None,None],score:0.0f64},|mut vertex_partition,(face,partition_size)|{
+                            if partition_size == &0{
+                                ControlFlow::Continue(vertex_partition)// We do not iterate over the second partition if it's size is 0 (this may be the second partition)
+                            }else
+                            {
+                                let mut partition = Partition{
+                                    faces: FxHashSet::default(),
+                                    edges: [partition_edge,partition_edge],
+                                    average_normal: Vector3::<f64>::zeros(),
+                                    score: 0.0,
+                                };
+                                //This should change the iteration direction and partition starting face based off of which partition from the set we're currently calculating (i)
+                                if let Some(face) = face{
+                                    // We now have our partition parameters (starting edge, partition size, and iteration direction
+                                    // We use a different iterator from the others here, and we have to do the same iteration twice
+                                    if (0usize..partition_size.clone()).try_fold(face, |face, _index|{
+                                        partition.average_normal += self.calculate_face_normal(&face,p);
+                                        partition.faces.insert(face.clone());
+                                        //Finish up iteration
+                                        partition.edges[1] = face.get_face_index_edge_other_edge(face.get_face_index_of_index(vertex_star_index).unwrap(), partition.edges[1]);
+                                        self.get_other_side_of_edge(&face, partition.edges[1])
+                                    }).is_some()
+                                    {
+                                        partition.average_normal /= partition.faces.len() as f64; // DO NOT DIVIDE BY VERTEX_ARITY
+                                        (self.partition_score)(&self, &mut partition, p);
+
+                                        if partition.score > vertex_partition.score {
+                                            //The score of a vertex partition (pair of partitions)
+                                            // is the maximum score of it's two partitions
+                                            vertex_partition.score = partition.score;
+                                        }
+                                        if vertex_partition.partitions[0].is_none(){
+                                            vertex_partition.partitions[0] = Some(partition);
+
+                                        }else{
+                                            vertex_partition.partitions[1] = Some(partition);
+                                        }
+                                        ControlFlow::Continue(vertex_partition)
+                                    } else
+                                    {
+                                        ControlFlow::Break(vertex_partition) //Interior iteration has failed, return None
+                                    }
+                                }else{
+                                    ControlFlow::Break(vertex_partition)
+                                }
+                            }
+
+                        }){
+                            if vertex_partition.score > current_partition.score{
+                                vertex_partition = current_partition;
+                            }
+                            ControlFlow::Continue(vertex_partition)
+                        }else{
+                            ControlFlow::Break(vertex_partition)
+                        }
+
+                    }){
+                        if vertex_partition.score > current_partition.score{
+                            vertex_partition = current_partition;
+                        }
+                        ControlFlow::Continue(vertex_partition)
+                    }else{
+                        ControlFlow::Break(vertex_partition)
+                    }
+
+                }){
+                    // If out of all the partition sizes,
+                    // expanding out in either direction, starting from this face,
+                    // we have obtained the partition set with the lowest score
+                    vertex_partition_map.insert(vertex_star_index, vertex_partition);
+                }
+            }
+        }
+        vertex_partition_map
+    }
+    fn calculate_pair_partition_score(&self, partition: &mut Partition,p: &[f64]) {
+        // if score > partition.score {
+        //     // The score for a given partition is the maximum of
+        //     // the magnitude squared of a face's normal from the average
+        //     // for all of it's faces
+        //     partition.score = score;
+        // }
+        let pnormal = match self.normalization{
+            Normalization::All => {
+                partition.average_normal.normalize()
+            }
+            Normalization::Score => {
+                partition.average_normal.normalize()
+            }
+            _ => {
+                partition.average_normal
+            }
+        };
+        // DIVIDE BY PARTITION SIZE
+        for face in &partition.faces{
+            for other_face in &partition.faces{
+                if other_face != face {
+                    let score =
+                        match self.normalization{
+                            Normalization::All => {
+                                self.calculate_face_normal(face,p).normalize()-self.calculate_face_normal(other_face, p).normalize()
+                            },
+                            Normalization::Score => {
+                                self.calculate_face_normal(face,p).normalize()-self.calculate_face_normal(other_face, p).normalize()
+                            },
+                            _=>{
+                                self.calculate_face_normal(face,p)-self.calculate_face_normal(other_face, p)
+                            }
+                        }.magnitude_squared();
+                    if score > partition.score {
+                        // The score for a given partition is the maximum of
+                        // the magnitude squared of a face's normal from the average
+                        // for all of it's faces
+                        partition.score = score;
+                    }
+
+                }
+            }
+
+        }
+    }
+    fn calculate_partition_score(&self, partition: &mut Partition,p: &[f64]){
+        let pnormal = match self.normalization{
+            Normalization::All => {
+                partition.average_normal.normalize()
+            }
+            Normalization::Score => {
+                partition.average_normal.normalize()
+            }
+            _ => {
+                partition.average_normal
+            }
+        };
+        // DIVIDE BY PARTITION SIZE
+        for face in &partition.faces{
+                let score =
+                    match self.normalization{
+                        Normalization::All => {
+                            self.calculate_face_normal(face,p).normalize()-pnormal
+                        },
+                        Normalization::Score => {
+                            self.calculate_face_normal(face,p).normalize()-pnormal
+                        },
+                        _=>{
+                            self.calculate_face_normal(face,p)-pnormal
+                        }
+                    }.magnitude_squared();
+                if score > partition.score {
+                    // The score for a given partition is the maximum of
+                    // the magnitude squared of a face's normal from the average
+                    // for all of it's faces
+                    partition.score = score;
+                }
+        }
+    }
+    fn calculate_pair_gradient(&self,p:&[f64],gradients:&mut [f64],partition:&Partition,vertex_star_index:&u32){
+        for face1 in partition.faces.iter(){
+            let i1_face_index = face1.get_face_index_of_index(vertex_star_index.clone()).unwrap();
+            let i1_index = face1.0[i1_face_index];
+            let j1_index = face1.0[(i1_face_index+1)%3];
+            let k1_index = face1.0[(i1_face_index+2)%3];
+            let i1 = get_vertex_position(p, i1_index);
+            let j1 = get_vertex_position(p, j1_index);
+            let k1 = get_vertex_position(p, k1_index);
+
+
+            let ejk1 = k1 - j1;
+            let eki1 = i1 - k1;
+            let eij1 = j1 - i1;
+            let mut face1_normal = eij1.cross(&eki1);
+            match self.normalization{
+                Normalization::All => {
+                    face1_normal = face1_normal.normalize();
+                }
+                Normalization::Gradient => {
+                    face1_normal = face1_normal.normalize();
+                }
+                ,_=>{}
+            };
+            let area1 = face1_normal.norm();
+
+                for face2 in partition.faces.iter(){
+                    if face2 != face1 {
+                        let i2_face_index = face2.get_face_index_of_index(vertex_star_index.clone()).unwrap();
+                        let i2_index = face2.0[i2_face_index];
+                        let j2_index = face2.0[(i2_face_index+1)%3];
+                        let k2_index = face2.0[(i2_face_index+2)%3];
+                        let i2 = get_vertex_position(p, i2_index);
+                        let j2 = get_vertex_position(p, j2_index);
+                        let k2 = get_vertex_position(p, k2_index);
+                        let ejk2 = k2 - j2;
+                        let eki2 = i2 - k2;
+                        let eij2 = j2 - i2;
+                        let mut face2_normal = eij2.cross(&eki2);
+                        // let i_face_index = face.get_face_index_of_index(*i_index).unwrap();
+                        match self.normalization{
+                            Normalization::All => {
+                                face2_normal = face2_normal.normalize();
+                            }
+                            Normalization::Gradient => {
+                                face2_normal = face2_normal.normalize();
+                            }
+                            ,_=>{}
+                        };
+                        let lhs = (face1_normal - face2_normal).transpose();
+
+                        // let lhs = face1_normal.normalize() - partition.average_normal;
+                        let area2 = face2_normal.norm();
+                        let d_ndi1 = ejk1.cross(&face1_normal)* face1_normal.transpose()/ area1;
+                        let d_ndj1 = eki1.cross(&face1_normal)* face1_normal.transpose()/ area1;
+                        let d_ndk1 = eij1.cross(&face1_normal)* face1_normal.transpose()/ area1;
+                        let d_ndi2 = ejk2.cross(&face2_normal)* face2_normal.transpose()/ area2;
+                        let d_ndj2 = eki2.cross(&face2_normal)* face2_normal.transpose()/ area2;
+                        let d_ndk2 = eij2.cross(&face2_normal)* face2_normal.transpose()/ area2;
+
+                        // let g_ndi = 2f64 * lhs.transpose()* d_ndi;
+                        // let g_ndj = 2f64 * lhs.transpose()* d_ndj;
+                        // let g_ndk = 2f64 * lhs.transpose()* d_ndk;
+                        let gi1 = lhs * d_ndi1;
+                        let gj1 = lhs * d_ndj1;
+                        let gk1 = lhs * d_ndk1;
+
+
+                        let gi2 = lhs * d_ndi2;
+                        let gj2 = lhs * d_ndj2;
+                        let gk2 = lhs * d_ndk2;
+                        for li in 0usize..3usize{
+                            gradients[i1_index as usize + li] += gi1[li];
+                            gradients[k1_index as usize + li] +=gk1[li];
+                            gradients[j1_index as usize+ li] += gj1[li];
+                            gradients[i2_index as usize + li] -= gi2[li];
+                            gradients[k2_index as usize + li] -=gk2[li];
+                            gradients[j2_index as usize+ li] -= gj2[li];
+                        }
+                    }
+                }
+
+
+        }
+    }
+    fn calculate_gradient(&self,p:&[f64],gradients:&mut [f64],partition:&Partition,vertex_star_index:&u32){
+        for face1 in partition.faces.iter(){
+            let i1_face_index = face1.get_face_index_of_index(vertex_star_index.clone()).unwrap();
+            let i1_index = face1.0[i1_face_index];
+            let j1_index = face1.0[(i1_face_index+1)%3];
+            let k1_index = face1.0[(i1_face_index+2)%3];
+            let i1 = get_vertex_position(p, i1_index);
+            let j1 = get_vertex_position(p, j1_index);
+            let k1 = get_vertex_position(p, k1_index);
+
+
+            let ejk1 = k1 - j1;
+            let eki1 = i1 - k1;
+            let eij1 = j1 - i1;
+            let mut face1_normal = eij1.cross(&eki1);
+            match self.normalization{
+                Normalization::All => {
+                    face1_normal = face1_normal.normalize();
+                }
+                Normalization::Gradient => {
+                    face1_normal = face1_normal.normalize();
+                }
+                ,_=>{}
+            };
+            let area1 = face1_normal.norm();
+
+            let pnormal = match self.normalization{
+                Normalization::All => {
+                    partition.average_normal.normalize()
+                }
+                Normalization::Gradient => {
+                    partition.average_normal.normalize()
+                }
+                _ => {
+                    partition.average_normal
+                }
+            };
+            let lhs = face1_normal - pnormal;
+            let mut d_ndi = ejk1.cross(&face1_normal)* face1_normal.transpose()/ area1;
+            let mut d_ndj = eki1.cross(&face1_normal)* face1_normal.transpose()/ area1;
+            let mut d_ndk = eij1.cross(&face1_normal)* face1_normal.transpose()/ area1;
+            d_ndi -= d_ndi.unscale(partition.faces.len() as f64);
+            d_ndj -= d_ndj.unscale(partition.faces.len() as f64);
+            d_ndk -= d_ndk.unscale(partition.faces.len() as f64);
+            let g_ndi = lhs.transpose()* d_ndi;
+            let g_ndj = lhs.transpose()* d_ndj;
+            let g_ndk =lhs.transpose()* d_ndk;
+            for li in 0usize..3usize{
+                gradients[i1_index as usize + li] += g_ndi.data.0[li][0];
+                gradients[k1_index as usize + li] += g_ndk.data.0[li][0];
+                gradients[j1_index as usize+ li] += g_ndj.data.0[li][0];
+            }
+        }
+    }
 }
 
 impl Face{
@@ -153,199 +514,8 @@ impl Face{
 fn get_vertex_position(positions:&[f64],vertex_index:u32)->Vector3<f64>{
     Vector3::from([positions[vertex_index as usize],positions[vertex_index as usize +1],positions[vertex_index as usize+2]])
 }
-impl MeshDevelopability {
-    fn get_edge_adjacent_faces(&self, edge:[u32;2]) ->Vec<&Face>{
-        let mut adjacent_faces = Vec::new();
-        for face in&self.vertex_face_map[&edge[0]]{
-            for rhs in &self.vertex_face_map[&edge[1]]{
-                if rhs == face{
-                    adjacent_faces.push(face);
-                }
-            }
-        }
-        adjacent_faces
-    }
-    fn get_other_side_of_edge(&self, face:Face,edge:[u32;2]) ->Option<&Face>{
-        let faces = self.get_edge_adjacent_faces(edge);
-        if faces.len() <= 1{
-            return None
-        }
-        if faces[0] == &face {
-            Some(faces[1])
-        } else { Some(faces[0]) }
-    }
-    fn calculate_face_normal(&self,face:&Face,p:&[f64])->Vector3<f64>{
-        let i1 = get_vertex_position(p,  face.0[0]);
-        let j1 = get_vertex_position(p, face.0[1]);
-        let k1 = get_vertex_position(p, face.0[2]);
-        // let i_face_index = face.get_face_index_of_index(*i_index).unwrap();
-        let eki1 = i1 - k1;
-        let eij1 = j1 - i1;
-        eij1.cross(&eki1)
-    }
 
-    fn create_vertex_partition_map(&self, p: &[f64]) -> FxHashMap<u32,VertexPartition>{
-        let mut vertex_partition_map:FxHashMap<u32,VertexPartition> =FxHashMap::default();
-        for partition_face in &self.faces{
-            'vertex_star_loop : for vertex_star_face_index in 0..3 {
-                let vertex_star_index = partition_face.0[vertex_star_face_index];
-                let vertex_star_faces = self.vertex_face_map.get(&vertex_star_index).unwrap();
-                let vertex_star_arity = vertex_star_faces.len();
-                if vertex_star_arity <= 3{
-                    continue 'vertex_star_loop;
-                }else if let ControlFlow::Continue(vertex_partition) = (1..=vertex_star_arity).try_fold(VertexPartition{partitions:[None,None],score:f64::MAX},| mut vertex_partition,big_partition_size|{
-                   // The primary partition contains at least one face in a given vertex star, but can contain all of them
-                    // For all faces, we iterate over both edges.
-                    // There is no mechanism to determine if an edge has been used for partitioning previously.
-                    // This doubles the amount of work done per triangle in a given mesh
-                    //I believe we can get away with iterating over just 1 edge, but this code lets be lazy AND correct  *hopefully
-                    let partition_face_edges = partition_face.get_face_index_face_edges(vertex_star_face_index);
-                    if let ControlFlow::Continue(current_partition) = partition_face_edges.iter().try_fold(VertexPartition{partitions:[None,None],score:f64::MAX},|mut vertex_partition,partition_face_edge|{
-                       let partition_edge = partition_face.convert_face_edge_to_edge(*partition_face_edge);
-                       if let ControlFlow::Continue(current_partition) = (0..2).try_fold(VertexPartition{partitions:[None,None],score:0.0f64},|mut vertex_partition,i|{
-                           let partition_size = if i == 0 {big_partition_size} else {vertex_star_arity - big_partition_size};
-                           if partition_size == 0{
-                               ControlFlow::Continue(vertex_partition)// We do not iterate over the second partition if it's size is 0 (this may be the second partition)
-                           }else
-                           {
-                               let mut partition = Partition{
-                                   faces: FxHashSet::default(),
-                                   edges: [partition_edge,partition_edge],
-                                   average_normal: Vector3::<f64>::zeros(),
-                                   score: 0.0,
-                               };
-                              //This should change the iteration direction and partition starting face based off of which partition from the set we're currently calculating (i)
-                               let face = if i == 0
-                               {
-                                   Some(partition_face.clone())
-                               } else
-                               {
-                                   self.get_other_side_of_edge(*partition_face,partition_edge).cloned()
-                               };
-                               if let Some(face) = face{
-                                   // We now have our partition parameters (starting edge, partition size, and iteration direction
-                                   // We use a different iterator from the others here, and we have to do the same iteration twice
-                                   if (0..partition_size).try_fold(face, |face, _index|{
-                                       partition.average_normal += self.calculate_face_normal(&face,p);
-                                       partition.faces.insert(face);
-                                       //Finish up iteration
-                                       partition.edges[1] = face.get_face_index_edge_other_edge(face.get_face_index_of_index(vertex_star_index).unwrap(), partition.edges[1]);
-                                       self.get_other_side_of_edge(face, partition.edges[1]).copied()
-                                   }).is_some()
-                                   {
-                                       partition.average_normal /= partition.faces.len() as f64; // DO NOT DIVIDE BY VERTEX_ARITY
-                                       let pnormal = match self.normalization{
-                                           Normalization::AllNormals => {
-                                               partition.average_normal.normalize()
-                                           }
-                                           Normalization::ScoreOnly => {
-                                               partition.average_normal.normalize()
-                                           }
-                                           _ => {
-                                               partition.average_normal
-                                           }
-                                       };
-                                       // DIVIDE BY PARTITION SIZE
-                                       for face in &partition.faces{
-                                           // for other_face in &&partition.faces{
-                                           //     if other_face != face{
-                                           //         let score = (self.calculate_face_normal(face,p) - self.calculate_face_normal(other_face,p)).ma;
-                                           if self.use_pairs{
-                                               for other_face in &partition.faces{
-                                                   if other_face != face {
-                                                       let score =
-                                                           match self.normalization{
-                                                               Normalization::AllNormals => {
-                                                                   self.calculate_face_normal(face,p).normalize()-self.calculate_face_normal(other_face, p).normalize()
-                                                               },
-                                                               Normalization::ScoreOnly => {
-                                                                   self.calculate_face_normal(face,p).normalize()-self.calculate_face_normal(other_face, p).normalize()
-                                                               },
-                                                               _=>{
-                                                                   self.calculate_face_normal(face,p)-self.calculate_face_normal(other_face, p)
-                                                               }
-                                                           }.magnitude_squared();
-                                                       if score > partition.score {
-                                                           // The score for a given partition is the maximum of
-                                                           // the magnitude squared of a face's normal from the average
-                                                           // for all of it's faces
-                                                           partition.score = score;
-                                                       }
-
-                                                   }
-                                               }
-                                           }else{
-                                               let score =
-                                                   match self.normalization{
-                                                       Normalization::AllNormals => {
-                                                           self.calculate_face_normal(face,p).normalize()-pnormal
-                                                       },
-                                                       Normalization::ScoreOnly => {
-                                                           self.calculate_face_normal(face,p).normalize()-pnormal
-                                                       },
-                                                       _=>{
-                                                           self.calculate_face_normal(face,p)-pnormal
-                                                       }
-                                                   }.magnitude_squared();
-                                               if score > partition.score {
-                                                   // The score for a given partition is the maximum of
-                                                   // the magnitude squared of a face's normal from the average
-                                                   // for all of it's faces
-                                                   partition.score = score;
-                                               }
-                                           }
-                                       }
-                                       if partition.score > vertex_partition.score {
-                                           //The score of a vertex partition (pair of partitions)
-                                           // is the maximum score of it's two partitions
-                                           vertex_partition.score = partition.score;
-                                       }
-                                       if vertex_partition.partitions[0].is_none(){
-                                           vertex_partition.partitions[0] = Some(partition);
-
-                                       }else{
-                                           vertex_partition.partitions[1] = Some(partition);
-                                       }
-                                       ControlFlow::Continue(vertex_partition)
-                                   } else
-                                   {
-                                       ControlFlow::Break(vertex_partition) //Interior iteration has failed, return None
-                                   }
-                               }else{
-                                   ControlFlow::Break(vertex_partition)
-                               }
-                           }
-
-                       }){
-                           if vertex_partition.score > current_partition.score{
-                               vertex_partition = current_partition;
-                           }
-                           ControlFlow::Continue(vertex_partition)
-                       }else{
-                           ControlFlow::Break(vertex_partition)
-                       }
-
-                   }){
-                        if vertex_partition.score > current_partition.score{
-                            vertex_partition = current_partition;
-                        }
-                        ControlFlow::Continue(vertex_partition)
-                    }else{
-                        ControlFlow::Break(vertex_partition)
-                    }
-
-                }){
-                   // If out of all the partition sizes,
-                   // expanding out in either direction, starting from this face,
-                   // we have obtained the partition set with the lowest score
-                    vertex_partition_map.insert(vertex_star_index, vertex_partition);
-                }
-            }
-        }
-        vertex_partition_map
-    }
-}
-impl CostFunction for MeshDevelopability {
+impl CostFunction for  MeshDevelopability {
     type Param = Vec<f64>;
     type Output = f64;
 
@@ -374,135 +544,8 @@ impl Gradient for MeshDevelopability {
         let mut gradients = vec![0f64;p.len()];
         for (vertex_star_index,vertex_partition) in partition_map.iter(){
             for partition in vertex_partition.partitions.iter().flatten(){
-                    for face1 in partition.faces.iter(){
-                        let i1_face_index = face1.get_face_index_of_index(vertex_star_index.clone()).unwrap();
-                        let i1_index = face1.0[i1_face_index];
-                        let j1_index = face1.0[(i1_face_index+1)%3];
-                        let k1_index = face1.0[(i1_face_index+2)%3];
-                        let i1 = get_vertex_position(p, i1_index);
-                        let j1 = get_vertex_position(p, j1_index);
-                        let k1 = get_vertex_position(p, k1_index);
+                (self.gradient_fn)(self,p,gradients.as_mut_slice(),partition,vertex_star_index);
 
-
-                        let ejk1 = k1 - j1;
-                        let eki1 = i1 - k1;
-                        let eij1 = j1 - i1;
-                        let mut face1_normal = eij1.cross(&eki1);
-                        match self.normalization{
-                            Normalization::AllNormals => {
-                                face1_normal = face1_normal.normalize();
-                            }
-                            Normalization::GradientOnly => {
-                                face1_normal = face1_normal.normalize();
-                            }
-                            ,_=>{}
-                        };
-                        let area1 = face1_normal.norm();
-
-                        if self.use_pairs{
-                            for face2 in partition.faces.iter(){
-                                if face2 != face1 {
-                                    let i2_face_index = face2.get_face_index_of_index(vertex_star_index.clone()).unwrap();
-                                    let i2_index = face2.0[i2_face_index];
-                                    let j2_index = face2.0[(i2_face_index+1)%3];
-                                    let k2_index = face2.0[(i2_face_index+2)%3];
-                                    let i2 = get_vertex_position(p, i2_index);
-                                    let j2 = get_vertex_position(p, j2_index);
-                                    let k2 = get_vertex_position(p, k2_index);
-                                    let ejk2 = k2 - j2;
-                                    let eki2 = i2 - k2;
-                                    let eij2 = j2 - i2;
-                                    let mut face2_normal = eij2.cross(&eki2);
-                                    // let i_face_index = face.get_face_index_of_index(*i_index).unwrap();
-                                    match self.normalization{
-                                        Normalization::AllNormals => {
-                                            face2_normal = face2_normal.normalize();
-                                        }
-                                        Normalization::GradientOnly => {
-                                            face2_normal = face2_normal.normalize();
-                                        }
-                                        ,_=>{}
-                                    };
-                                    let lhs = (face1_normal - face2_normal).transpose();
-
-                                    // let lhs = face1_normal.normalize() - partition.average_normal;
-                                    let area2 = face2_normal.norm();
-                                    let d_ndi1 = ejk1.cross(&face1_normal)* face1_normal.transpose()/ area1;
-                                    let d_ndj1 = eki1.cross(&face1_normal)* face1_normal.transpose()/ area1;
-                                    let d_ndk1 = eij1.cross(&face1_normal)* face1_normal.transpose()/ area1;
-                                    let d_ndi2 = ejk2.cross(&face2_normal)* face2_normal.transpose()/ area2;
-                                    let d_ndj2 = eki2.cross(&face2_normal)* face2_normal.transpose()/ area2;
-                                    let d_ndk2 = eij2.cross(&face2_normal)* face2_normal.transpose()/ area2;
-
-                                                                       // let g_ndi = 2f64 * lhs.transpose()* d_ndi;
-                                    // let g_ndj = 2f64 * lhs.transpose()* d_ndj;
-                                    // let g_ndk = 2f64 * lhs.transpose()* d_ndk;
-                                    let gi1 = lhs * d_ndi1;
-                                    let gj1 = lhs * d_ndj1;
-                                    let gk1 = lhs * d_ndk1;
-
-
-                                    let gi2 = lhs * d_ndi2;
-                                    let gj2 = lhs * d_ndj2;
-                                    let gk2 = lhs * d_ndk2;
-                                    for li in 0usize..3usize{
-                                        gradients[i1_index as usize + li] += gi1[li];
-                                        gradients[k1_index as usize + li] +=gk1[li];
-                                        gradients[j1_index as usize+ li] += gj1[li];
-                                        gradients[i2_index as usize + li] -= gi2[li];
-                                        gradients[k2_index as usize + li] -=gk2[li];
-                                        gradients[j2_index as usize+ li] -= gj2[li];
-                                    }
-                                }
-                            }
-
-                        }else{
-                            let pnormal = match self.normalization{
-                                Normalization::AllNormals => {
-                                    partition.average_normal.normalize()
-                                }
-                                Normalization::ScoreOnly => {
-                                    partition.average_normal.normalize()
-                                }
-                                _ => {
-                                    partition.average_normal
-                                }
-                            };
-                            let lhs = face1_normal - pnormal;
-                            let mut d_ndi = ejk1.cross(&face1_normal)* face1_normal.transpose()/ area1;
-                            let mut d_ndj = eki1.cross(&face1_normal)* face1_normal.transpose()/ area1;
-                            let mut d_ndk = eij1.cross(&face1_normal)* face1_normal.transpose()/ area1;
-                            d_ndi -= d_ndi.unscale(partition.faces.len() as f64);
-                            d_ndj -= d_ndj.unscale(partition.faces.len() as f64);
-                            d_ndk -= d_ndk.unscale(partition.faces.len() as f64);
-                            let g_ndi = lhs.transpose()* d_ndi;
-                            let g_ndj = lhs.transpose()* d_ndj;
-                            let g_ndk =lhs.transpose()* d_ndk;
-                            for li in 0usize..3usize{
-                                gradients[i1_index as usize + li] += g_ndi.data.0[li][0];
-                                gradients[k1_index as usize + li] += g_ndk.data.0[li][0];
-                                gradients[j1_index as usize+ li] += g_ndj.data.0[li][0];
-                            }
-                        }
-                        // if true{
-                        //         let mut normal_gradient:Matrix3<f32> =  ((i-j).cross(&face_normal))* face_normal.transpose().unscale(area);
-                        //         normal_gradient -= normal_gradient / partition.faces.len() as f32;
-                        //         let index = face.0[face_index] as usize;
-                        //         let gradient:Vector3<f32> =  (lhs.transpose()* normal_gradient).transpose().scale(2f32);
-                        //         gradients[index] += gradient[0];
-                        //         gradients[index+1] += gradient[1];
-                        //         gradients[index+2] += gradient[2];
-                            // }else{
-                            //     let grad_area = face_normal.unscale(2f32).cross(&(i-j)).pseudo_inverse(f32::default_epsilon()).unwrap();
-                            //     let mut normal_gradient =( grad_area * (i-j).cross(&face_normal)) * face_normal.transpose();
-                            //     normal_gradient -= normal_gradient / partition.faces.len() as f32;
-                            //     let index = face.0[face_index] as usize;
-                            //     let gradient =  (lhs.dot(&normal_gradient)).scale(2f32);
-                            //     gradients[index] += gradient[0];
-                            //     gradients[index+1] += gradient[1];
-                            //     gradients[index+2] += gradient[2];
-                            // };
-                }
             }
         }
         Ok(gradients)
@@ -551,15 +594,15 @@ fn main() {
         f64_vertices.push([vertex[0] as f64,vertex[1]as f64,vertex[2]as f64]);
     }
     let mut triangles: Vec<[u32;3]> = Vec::new();
-    let mut vertex_face_map: BTreeMap<u32,Vec<Face>> = BTreeMap::new();
+    let mut vertex_face_map: FxHashMap<u32,Vec<Face>> = FxHashMap::default();
     let faces = (0..indices.len()/3).map(|face_index|{
         let face = Face([indices[face_index*3],indices[face_index*3+1],indices[face_index*3+2]]);
         triangles.push(face.0);
         for vertex_index in face.0{
-            if let std::collections::btree_map::Entry::Vacant(e) = vertex_face_map.entry(vertex_index) {
-                e.insert(vec![face]);
+            if let Some(mut e) = vertex_face_map.get_mut(&vertex_index) {
+               e.push(face);
             } else {
-                vertex_face_map.get_mut(&vertex_index).unwrap().push(face);
+                vertex_face_map.insert(vertex_index, vec![face]);
             }
         }
         face
@@ -567,7 +610,17 @@ fn main() {
     println!("Total triangles: {}",triangles.len());
 
     Python::with_gil(|py| {
-        let developability_problem = MeshDevelopability{faces,vertex_face_map,use_pairs:args.use_pairs,normalization:args.normalization};
+        let partition_score_fn = if args.use_pairs{
+            MeshDevelopability::calculate_pair_partition_score
+        }else{
+            MeshDevelopability::calculate_partition_score
+        };
+        let gradient_fn = if args.use_pairs{
+            MeshDevelopability::calculate_pair_gradient
+        }else{
+            MeshDevelopability::calculate_gradient
+        };
+        let developability_problem = MeshDevelopability{faces,vertex_face_map,partition_score:partition_score_fn,normalization:args.normalization, gradient_fn };
         // let linesearch = argmin::solver::linesearch::HagerZhangLineSearch::new();
             //.with_delta_sigma(0.1,0.2)
             //.unwrap();
